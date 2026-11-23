@@ -1,0 +1,14 @@
+{
+  "name": "mend",
+  "version": "1.0.0",
+  "description": "One patch tool for every AI edit format (Make.fun bounty)",
+  "type": "module",
+  "main": "main.ts",
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts",
+    "test": "node --experimental-strip-types ../practice/check.ts ../starter-kit/hidden-spec-cli-01-run-20261122-kit/program/generator/practice.json"
+  },
+  "keywords": ["mend", "patch", "unified-diff", "search-replace", "v4a", "json"],
+  "author": "Kuro",
+  "license": "MIT"
+}
