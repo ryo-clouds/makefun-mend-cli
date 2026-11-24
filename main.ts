@@ -430,16 +430,16 @@ function buildSearchReplaceEdits(rawText: string, lines: string[], isStrictMatch
   return plannedEdits;
 }
 
-function sanitizeUnifiedPath(rawPath: string): string {
-  if (rawPath === '/dev/null') return '/dev/null';
-  if (rawPath.startsWith('a/') || rawPath.startsWith('b/')) return rawPath.slice(2);
-  return rawPath;
+interface UnifiedDiffHunkRecord {
+  sourceLineNumber: number;
+  hunkBodyLines: Array<{ kind: ' ' | '-' | '+' | '\\'; text: string }>;
+  suppressTrailingBreak: boolean;
 }
 
-interface ParsedUnifiedHunk {
-  startLineA: number;
-  lines: Array<{ kind: ' ' | '-' | '+' | '\\'; text: string }>;
-  hasBackslashAtEnd: boolean;
+function normalizeUnifiedHeaderPath(pathString: string): string {
+  if (pathString === '/dev/null') return '/dev/null';
+  if (pathString.startsWith('a/') || pathString.startsWith('b/')) return pathString.slice(2);
+  return pathString;
 }
 
 function buildUnifiedEdits(
@@ -448,177 +448,175 @@ function buildUnifiedEdits(
   isStrictMatching: boolean,
   recordedMoves: Array<{ oldPath: string; newPath: string }>
 ): FileMutationAction[] {
-  const plannedEdits: FileMutationAction[] = [];
-  let scanIndex = 0;
+  const actionsList: FileMutationAction[] = [];
+  let lineCursor = 0;
 
-  while (scanIndex < lines.length) {
-    let isDiffGitHeader = false;
-    let gitOldPath: string | null = null;
-    let gitNewPath: string | null = null;
+  while (lineCursor < lines.length) {
+    let gitOld: string | null = null;
+    let gitNew: string | null = null;
 
-    if (lines[scanIndex].startsWith('diff --git ')) {
-      const match = lines[scanIndex].match(/^diff --git a\/(.+) b\/(.+)$/);
-      if (!match) throw new PatchSyntaxError(`error: parse ${scanIndex + 1}`);
-      isDiffGitHeader = true;
-      gitOldPath = match[1];
-      gitNewPath = match[2];
-      scanIndex++;
-    } else if (lines[scanIndex].startsWith('--- ') && (lines[scanIndex + 1] ?? '').startsWith('+++ ')) {
-      // standard unified header
+    if (lines[lineCursor].startsWith('diff --git ')) {
+      const gitMatch = lines[lineCursor].match(/^diff --git a\/(.+) b\/(.+)$/);
+      if (!gitMatch) throw new PatchSyntaxError(`error: parse ${lineCursor + 1}`);
+      gitOld = gitMatch[1];
+      gitNew = gitMatch[2];
+      lineCursor++;
+    } else if (lines[lineCursor].startsWith('--- ') && (lines[lineCursor + 1] ?? '').startsWith('+++ ')) {
+      // standard diff header pair
     } else {
-      if (lines[scanIndex].startsWith('@@')) {
-        throw new PatchSyntaxError(`error: parse ${scanIndex + 1}`);
+      if (lines[lineCursor].startsWith('@@')) {
+        throw new PatchSyntaxError(`error: parse ${lineCursor + 1}`);
       }
-      scanIndex++;
+      lineCursor++;
       continue;
     }
 
-    let sourcePath: string | null = gitOldPath;
-    let destinationPath: string | null = gitNewPath;
-    let isFileCreation = false;
-    let isFileDeletion = false;
-    let renameSource: string | null = null;
-    let renameDestination: string | null = null;
-    let encounteredMinusHeader = false;
+    let resolvedSourcePath: string | null = gitOld;
+    let resolvedDestPath: string | null = gitNew;
+    let marksNewFile = false;
+    let marksDeletedFile = false;
+    let gitRenameSource: string | null = null;
+    let gitRenameDest: string | null = null;
+    let sawUnifiedHeaderMinus = false;
 
-    const parsedHunks: ParsedUnifiedHunk[] = [];
+    const collectedHunks: UnifiedDiffHunkRecord[] = [];
 
-    while (scanIndex < lines.length) {
-      const currentLine = lines[scanIndex];
+    while (lineCursor < lines.length) {
+      const inspectLine = lines[lineCursor];
 
       if (
-        currentLine.startsWith('diff --git ') ||
-        (currentLine.startsWith('--- ') && (lines[scanIndex + 1] ?? '').startsWith('+++ ') && (parsedHunks.length > 0 || encounteredMinusHeader))
+        inspectLine.startsWith('diff --git ') ||
+        (inspectLine.startsWith('--- ') && (lines[lineCursor + 1] ?? '').startsWith('+++ ') && (collectedHunks.length > 0 || sawUnifiedHeaderMinus))
       ) {
         break;
       }
 
-      if (currentLine.startsWith('@@')) {
-        const hunkMatch = currentLine.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-        if (!hunkMatch) throw new PatchSyntaxError(`error: parse ${scanIndex + 1}`);
-        const startLineA = parseInt(hunkMatch[1], 10);
-        scanIndex++;
+      if (inspectLine.startsWith('@@')) {
+        const headerMatch = inspectLine.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        if (!headerMatch) throw new PatchSyntaxError(`error: parse ${lineCursor + 1}`);
+        const sourceLineNumber = parseInt(headerMatch[1], 10);
+        lineCursor++;
 
-        const hunkLines: Array<{ kind: ' ' | '-' | '+' | '\\'; text: string }> = [];
-        while (scanIndex < lines.length) {
-          const bodyLine = lines[scanIndex];
-          if (bodyLine.startsWith('diff --git ') || (bodyLine.startsWith('--- ') && (lines[scanIndex + 1] ?? '').startsWith('+++ '))) {
+        const currentHunkItems: Array<{ kind: ' ' | '-' | '+' | '\\'; text: string }> = [];
+        while (lineCursor < lines.length) {
+          const bodyItem = lines[lineCursor];
+          if (bodyItem.startsWith('diff --git ') || (bodyItem.startsWith('--- ') && (lines[lineCursor + 1] ?? '').startsWith('+++ '))) {
             break;
           }
-          if (bodyLine.startsWith('@@')) {
+          if (bodyItem.startsWith('@@')) {
             break;
           }
-          if (bodyLine.startsWith(' ') || bodyLine === '') {
-            hunkLines.push({ kind: ' ', text: bodyLine.startsWith(' ') ? bodyLine.slice(1) : '' });
-            scanIndex++;
-          } else if (bodyLine.startsWith('-')) {
-            hunkLines.push({ kind: '-', text: bodyLine.slice(1) });
-            scanIndex++;
-          } else if (bodyLine.startsWith('+')) {
-            hunkLines.push({ kind: '+', text: bodyLine.slice(1) });
-            scanIndex++;
-          } else if (bodyLine.startsWith('\\')) {
-            hunkLines.push({ kind: '\\', text: bodyLine.slice(1) });
-            scanIndex++;
+          if (bodyItem.startsWith(' ') || bodyItem === '') {
+            currentHunkItems.push({ kind: ' ', text: bodyItem.startsWith(' ') ? bodyItem.slice(1) : '' });
+            lineCursor++;
+          } else if (bodyItem.startsWith('-')) {
+            currentHunkItems.push({ kind: '-', text: bodyItem.slice(1) });
+            lineCursor++;
+          } else if (bodyItem.startsWith('+')) {
+            currentHunkItems.push({ kind: '+', text: bodyItem.slice(1) });
+            lineCursor++;
+          } else if (bodyItem.startsWith('\\')) {
+            currentHunkItems.push({ kind: '\\', text: bodyItem.slice(1) });
+            lineCursor++;
           } else {
             break;
           }
         }
 
-        while (hunkLines.length > 0 && hunkLines[hunkLines.length - 1].kind === ' ' && hunkLines[hunkLines.length - 1].text === '') {
-          hunkLines.pop();
+        while (currentHunkItems.length > 0 && currentHunkItems[currentHunkItems.length - 1].kind === ' ' && currentHunkItems[currentHunkItems.length - 1].text === '') {
+          currentHunkItems.pop();
         }
 
-        let hasBackslashAtEnd = false;
-        let lastContextOrAddIndex = -1;
-        for (let idx = hunkLines.length - 1; idx >= 0; idx--) {
-          if (hunkLines[idx].kind === ' ' || hunkLines[idx].kind === '+') {
-            lastContextOrAddIndex = idx;
+        let suppressTrailingBreak = false;
+        let lastContextOrAddition = -1;
+        for (let idx = currentHunkItems.length - 1; idx >= 0; idx--) {
+          if (currentHunkItems[idx].kind === ' ' || currentHunkItems[idx].kind === '+') {
+            lastContextOrAddition = idx;
             break;
           }
         }
-        if (lastContextOrAddIndex >= 0 && lastContextOrAddIndex + 1 < hunkLines.length && hunkLines[lastContextOrAddIndex + 1].kind === '\\') {
-          hasBackslashAtEnd = true;
+        if (lastContextOrAddition >= 0 && lastContextOrAddition + 1 < currentHunkItems.length && currentHunkItems[lastContextOrAddition + 1].kind === '\\') {
+          suppressTrailingBreak = true;
         }
 
-        parsedHunks.push({ startLineA, lines: hunkLines, hasBackslashAtEnd });
+        collectedHunks.push({ sourceLineNumber, hunkBodyLines: currentHunkItems, suppressTrailingBreak });
         continue;
       }
 
-      if (currentLine.startsWith('--- ')) {
-        const nextLine = lines[scanIndex + 1] ?? '';
-        if (!nextLine.startsWith('+++ ')) {
-          throw new PatchSyntaxError(`error: parse ${scanIndex + 2}`);
+      if (inspectLine.startsWith('--- ')) {
+        const pairedLine = lines[lineCursor + 1] ?? '';
+        if (!pairedLine.startsWith('+++ ')) {
+          throw new PatchSyntaxError(`error: parse ${lineCursor + 2}`);
         }
-        const rawOld = currentLine.slice(4).split('\t')[0].trim();
-        const rawNew = nextLine.slice(4).split('\t')[0].trim();
-        sourcePath = sanitizeUnifiedPath(rawOld);
-        destinationPath = sanitizeUnifiedPath(rawNew);
-        encounteredMinusHeader = true;
-        scanIndex += 2;
+        const parsedOld = inspectLine.slice(4).split('\t')[0].trim();
+        const parsedNew = pairedLine.slice(4).split('\t')[0].trim();
+        resolvedSourcePath = normalizeUnifiedHeaderPath(parsedOld);
+        resolvedDestPath = normalizeUnifiedHeaderPath(parsedNew);
+        sawUnifiedHeaderMinus = true;
+        lineCursor += 2;
         continue;
       }
 
-      if (currentLine.startsWith('rename from ')) {
-        renameSource = sanitizeUnifiedPath(currentLine.slice(12).trim());
-        scanIndex++;
+      if (inspectLine.startsWith('rename from ')) {
+        gitRenameSource = normalizeUnifiedHeaderPath(inspectLine.slice(12).trim());
+        lineCursor++;
         continue;
       }
-      if (currentLine.startsWith('rename to ')) {
-        renameDestination = sanitizeUnifiedPath(currentLine.slice(10).trim());
-        scanIndex++;
+      if (inspectLine.startsWith('rename to ')) {
+        gitRenameDest = normalizeUnifiedHeaderPath(inspectLine.slice(10).trim());
+        lineCursor++;
         continue;
       }
-      if (currentLine.startsWith('new file mode')) {
-        isFileCreation = true;
-        scanIndex++;
+      if (inspectLine.startsWith('new file mode')) {
+        marksNewFile = true;
+        lineCursor++;
         continue;
       }
-      if (currentLine.startsWith('deleted file mode')) {
-        isFileDeletion = true;
-        scanIndex++;
+      if (inspectLine.startsWith('deleted file mode')) {
+        marksDeletedFile = true;
+        lineCursor++;
         continue;
       }
 
-      scanIndex++;
+      lineCursor++;
     }
 
-    if (!encounteredMinusHeader && renameSource !== null && renameDestination !== null) {
-      sourcePath = renameSource;
-      destinationPath = renameDestination;
+    if (!sawUnifiedHeaderMinus && gitRenameSource !== null && gitRenameDest !== null) {
+      resolvedSourcePath = gitRenameSource;
+      resolvedDestPath = gitRenameDest;
     }
 
-    if (sourcePath === null && destinationPath === null) continue;
+    if (resolvedSourcePath === null && resolvedDestPath === null) continue;
 
-    const effectiveOldPath = sourcePath ?? destinationPath!;
-    const effectiveNewPath = destinationPath ?? sourcePath!;
-    const isCreation = effectiveOldPath === '/dev/null' || isFileCreation;
-    const isDeletion = effectiveNewPath === '/dev/null' || isFileDeletion;
+    const effectiveOldPath = resolvedSourcePath ?? resolvedDestPath!;
+    const effectiveNewPath = resolvedDestPath ?? resolvedSourcePath!;
+    const isCreation = effectiveOldPath === '/dev/null' || marksNewFile;
+    const isDeletion = effectiveNewPath === '/dev/null' || marksDeletedFile;
     const isRenameMove = !isCreation && !isDeletion && effectiveOldPath !== effectiveNewPath;
 
     if (isRenameMove) {
       recordedMoves.push({ oldPath: effectiveOldPath, newPath: effectiveNewPath });
     }
 
-    plannedEdits.push((tree) => {
+    actionsList.push((tree) => {
       if (isCreation) {
         if (!validatePathSafety(effectiveNewPath)) throw new PatchApplyFailure('unsafe', effectiveNewPath);
         if (tree.pathExistsOnDiskOrStage(effectiveNewPath)) throw new PatchApplyFailure('exists', effectiveNewPath);
-        const accumulatedAdditions: string[] = [];
-        for (const hunk of parsedHunks) {
-          for (const hl of hunk.lines) {
-            if (hl.kind === '+') accumulatedAdditions.push(hl.text);
+        const addedLinesList: string[] = [];
+        for (const hunk of collectedHunks) {
+          for (const hl of hunk.hunkBodyLines) {
+            if (hl.kind === '+') addedLinesList.push(hl.text);
           }
         }
-        let missingTerminalNewline = false;
-        for (let hunkIdx = parsedHunks.length - 1; hunkIdx >= 0; hunkIdx--) {
-          const hunk = parsedHunks[hunkIdx];
-          if (hunk.lines.some((hl) => hl.kind === '+')) {
-            missingTerminalNewline = hunk.hasBackslashAtEnd;
+        let omitFinalBreak = false;
+        for (let hunkIdx = collectedHunks.length - 1; hunkIdx >= 0; hunkIdx--) {
+          const hunk = collectedHunks[hunkIdx];
+          if (hunk.hunkBodyLines.some((hl) => hl.kind === '+')) {
+            omitFinalBreak = hunk.suppressTrailingBreak;
             break;
           }
         }
-        tree.stagedFiles.set(effectiveNewPath, accumulatedAdditions.length === 0 ? '' : accumulatedAdditions.join('\n') + (missingTerminalNewline ? '' : '\n'));
+        tree.stagedFiles.set(effectiveNewPath, addedLinesList.length === 0 ? '' : addedLinesList.join('\n') + (omitFinalBreak ? '' : '\n'));
         return;
       }
 
@@ -643,10 +641,10 @@ function buildUnifiedEdits(
       const parsedDoc = dissectDocumentText(originalText);
       let cumulativeLineOffset = 0;
 
-      for (const hunk of parsedHunks) {
+      for (const hunk of collectedHunks) {
         const expectedPattern: string[] = [];
         const replacementHunks: UnifiedHunkElement[] = [];
-        for (const hl of hunk.lines) {
+        for (const hl of hunk.hunkBodyLines) {
           if (hl.kind === ' ') {
             const contextPos = expectedPattern.length;
             expectedPattern.push(hl.text);
@@ -663,7 +661,7 @@ function buildUnifiedEdits(
           if (matchRes.matchingTier === -1 || matchRes.matchPositions.length === 0) {
             throw new PatchApplyFailure('no-match', effectiveOldPath);
           }
-          const idealPosition = hunk.startLineA - 1 + cumulativeLineOffset;
+          const idealPosition = hunk.sourceLineNumber - 1 + cumulativeLineOffset;
           let bestPosition = matchRes.matchPositions[0];
           let minimumDistance = Math.abs(bestPosition - idealPosition);
           for (let k = 1; k < matchRes.matchPositions.length; k++) {
@@ -677,15 +675,15 @@ function buildUnifiedEdits(
           const substituted = substituteTargetLines(parsedDoc.lines, bestPosition, expectedPattern, replacementHunks, matchRes.matchingTier);
           parsedDoc.lines.splice(bestPosition, expectedPattern.length, ...substituted);
           if (extendsToEof) {
-            parsedDoc.hasTerminalNewline = !hunk.hasBackslashAtEnd;
+            parsedDoc.hasTerminalNewline = !hunk.suppressTrailingBreak;
           }
         } else {
-          const insertPosition = Math.min(Math.max(0, hunk.startLineA + cumulativeLineOffset), parsedDoc.lines.length);
+          const insertPosition = Math.min(Math.max(0, hunk.sourceLineNumber + cumulativeLineOffset), parsedDoc.lines.length);
           const extendsToEof = insertPosition === parsedDoc.lines.length;
           const substituted = substituteTargetLines(parsedDoc.lines, insertPosition, [''], replacementHunks, 0);
           parsedDoc.lines.splice(insertPosition, 0, ...substituted);
           if (extendsToEof) {
-            parsedDoc.hasTerminalNewline = !hunk.hasBackslashAtEnd;
+            parsedDoc.hasTerminalNewline = !hunk.suppressTrailingBreak;
           }
         }
         cumulativeLineOffset += replacementHunks.length - expectedPattern.length;
@@ -701,7 +699,7 @@ function buildUnifiedEdits(
     });
   }
 
-  return plannedEdits;
+  return actionsList;
 }
 
 interface ParsedV4AChunk {
