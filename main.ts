@@ -702,10 +702,153 @@ function buildUnifiedEdits(
   return actionsList;
 }
 
-interface ParsedV4AChunk {
-  anchorLine: string | null;
-  chunkLines: Array<{ kind: ' ' | '-' | '+'; text: string }>;
-  isTerminatedAtEof: boolean;
+interface V4APatchHunk {
+  contextAnchor: string | null;
+  hunkDiffLines: Array<{ indicator: ' ' | '-' | '+'; lineText: string }>;
+  eofTerminated: boolean;
+}
+
+function verifyV4ABoundaries(patchLines: string[]): { bodyStart: number; bodyEnd: number } {
+  let startIndex = -1;
+  for (let idx = 0; idx < patchLines.length; idx++) {
+    if (!isWhitespaceLine(patchLines[idx])) {
+      startIndex = idx;
+      break;
+    }
+  }
+  if (startIndex === -1) {
+    throw new PatchSyntaxError('error: parse 1');
+  }
+  if (patchLines[startIndex].trim() !== '*** Begin Patch') {
+    throw new PatchSyntaxError(`error: parse ${startIndex + 1}`);
+  }
+
+  let stopIndex = -1;
+  for (let idx = patchLines.length - 1; idx >= 0; idx--) {
+    if (!isWhitespaceLine(patchLines[idx])) {
+      stopIndex = idx;
+      break;
+    }
+  }
+  if (stopIndex === -1 || patchLines[stopIndex].trim() !== '*** End Patch') {
+    throw new PatchSyntaxError(`error: parse ${patchLines.length + 1}`);
+  }
+
+  return { bodyStart: startIndex + 1, bodyEnd: stopIndex };
+}
+
+function isV4ACommandBoundary(lineString: string): boolean {
+  return (
+    lineString.startsWith('*** Add File: ') ||
+    lineString.startsWith('*** Delete File: ') ||
+    lineString.startsWith('*** Update File: ') ||
+    lineString.trim() === '*** End Patch'
+  );
+}
+
+function checkV4ATrailingPaddingOnly(allLines: string[], currentPos: number, limitPos: number): boolean {
+  for (let scan = currentPos; scan < limitPos; scan++) {
+    if (isV4ACommandBoundary(allLines[scan])) {
+      return true;
+    }
+    if (!isWhitespaceLine(allLines[scan])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function advancePastV4APadding(allLines: string[], currentPos: number, limitPos: number): number {
+  let scan = currentPos;
+  while (scan < limitPos && !isV4ACommandBoundary(allLines[scan])) {
+    scan++;
+  }
+  return scan;
+}
+
+function locateV4AAnchorLine(
+  documentLines: string[],
+  anchorTarget: string,
+  searchOffset: number,
+  strictMatching: boolean
+): number {
+  for (let idx = searchOffset; idx < documentLines.length; idx++) {
+    if (documentLines[idx] === anchorTarget) return idx;
+  }
+  if (strictMatching) return -1;
+
+  const trimmedTarget = stripTrailingWhitespace(anchorTarget);
+  for (let idx = searchOffset; idx < documentLines.length; idx++) {
+    if (stripTrailingWhitespace(documentLines[idx]) === trimmedTarget) return idx;
+  }
+
+  const normalizedTarget = stripSurroundingWhitespace(anchorTarget);
+  for (let idx = searchOffset; idx < documentLines.length; idx++) {
+    if (stripSurroundingWhitespace(documentLines[idx]) === normalizedTarget) return idx;
+  }
+
+  return -1;
+}
+
+function executeV4AHunkTransformation(
+  parsedDocument: ParsedTextDocument,
+  hunk: V4APatchHunk,
+  currentScanOffset: number,
+  strictMatching: boolean,
+  targetFileLabel: string
+): number {
+  let searchCursor = currentScanOffset;
+
+  if (hunk.contextAnchor !== null) {
+    const matchedAnchorIdx = locateV4AAnchorLine(parsedDocument.lines, hunk.contextAnchor, searchCursor, strictMatching);
+    if (matchedAnchorIdx === -1) {
+      throw new PatchApplyFailure('no-match', targetFileLabel);
+    }
+    searchCursor = matchedAnchorIdx + 1;
+  }
+
+  const expectedPatterns: string[] = [];
+  const replacementElements: UnifiedHunkElement[] = [];
+
+  for (const diffItem of hunk.hunkDiffLines) {
+    if (diffItem.indicator === ' ') {
+      const cIndex = expectedPatterns.length;
+      expectedPatterns.push(diffItem.lineText);
+      replacementElements.push({ text: diffItem.lineText, isContext: true, contextIndex: cIndex });
+    } else if (diffItem.indicator === '-') {
+      expectedPatterns.push(diffItem.lineText);
+    } else if (diffItem.indicator === '+') {
+      replacementElements.push({ text: diffItem.lineText, isContext: false });
+    }
+  }
+
+  if (expectedPatterns.length > 0) {
+    const patternOutcome = locatePatternOccurrences(
+      parsedDocument.lines,
+      expectedPatterns,
+      strictMatching,
+      searchCursor,
+      hunk.eofTerminated
+    );
+    if (patternOutcome.matchingTier === -1 || patternOutcome.matchPositions.length === 0) {
+      throw new PatchApplyFailure('no-match', targetFileLabel);
+    }
+    const targetMatchIndex = patternOutcome.matchPositions[0];
+    const generatedLines = substituteTargetLines(
+      parsedDocument.lines,
+      targetMatchIndex,
+      expectedPatterns,
+      replacementElements,
+      patternOutcome.matchingTier
+    );
+    parsedDocument.lines.splice(targetMatchIndex, expectedPatterns.length, ...generatedLines);
+    return targetMatchIndex + generatedLines.length;
+  } else {
+    const insertionPoint = hunk.eofTerminated ? parsedDocument.lines.length : searchCursor;
+    const generatedLines = substituteTargetLines(parsedDocument.lines, insertionPoint, [''], replacementElements, 0);
+    parsedDocument.lines.splice(insertionPoint, 0, ...generatedLines);
+    return insertionPoint + generatedLines.length;
+  }
 }
 
 function buildV4AEdits(
@@ -714,292 +857,196 @@ function buildV4AEdits(
   isStrictMatching: boolean,
   recordedMoves: Array<{ oldPath: string; newPath: string }>
 ): FileMutationAction[] {
-  const firstNonEmptyIndex = lines.findIndex((l) => !isWhitespaceLine(l));
-  if (firstNonEmptyIndex < 0) throw new PatchSyntaxError('error: parse 1');
-  if (lines[firstNonEmptyIndex].trim() !== '*** Begin Patch') {
-    throw new PatchSyntaxError(`error: parse ${firstNonEmptyIndex + 1}`);
-  }
-
-  let finalNonEmptyIndex = -1;
-  for (let idx = lines.length - 1; idx >= 0; idx--) {
-    if (!isWhitespaceLine(lines[idx])) {
-      finalNonEmptyIndex = idx;
-      break;
-    }
-  }
-  if (finalNonEmptyIndex < 0 || lines[finalNonEmptyIndex].trim() !== '*** End Patch') {
-    throw new PatchSyntaxError(`error: parse ${lines.length + 1}`);
-  }
-
+  const { bodyStart, bodyEnd } = verifyV4ABoundaries(lines);
   const plannedEdits: FileMutationAction[] = [];
-  let scanIndex = firstNonEmptyIndex + 1;
+  let linePointer = bodyStart;
 
-  while (scanIndex < finalNonEmptyIndex) {
-    if (isWhitespaceLine(lines[scanIndex])) {
-      scanIndex++;
+  while (linePointer < bodyEnd) {
+    if (isWhitespaceLine(lines[linePointer])) {
+      linePointer++;
       continue;
     }
 
-    const currentLine = lines[scanIndex];
-    if (currentLine.startsWith('*** Add File: ')) {
-      const targetPath = currentLine.slice(14).trim();
-      scanIndex++;
-      const addedFileLines: string[] = [];
-      while (scanIndex < finalNonEmptyIndex) {
-        const lineContent = lines[scanIndex];
-        if (
-          lineContent.startsWith('*** Add File: ') ||
-          lineContent.startsWith('*** Delete File: ') ||
-          lineContent.startsWith('*** Update File: ') ||
-          lineContent.trim() === '*** End Patch'
-        ) {
+    const currentHeader = lines[linePointer];
+
+    if (currentHeader.startsWith('*** Add File: ')) {
+      const addedFilePath = currentHeader.slice(14).trim();
+      linePointer++;
+      const payloadLines: string[] = [];
+
+      while (linePointer < bodyEnd) {
+        const itemLine = lines[linePointer];
+        if (isV4ACommandBoundary(itemLine)) {
           break;
         }
-        if (lineContent.startsWith('+')) {
-          addedFileLines.push(lineContent.slice(1));
-          scanIndex++;
-        } else if (lineContent === '') {
-          addedFileLines.push('');
-          scanIndex++;
+
+        if (itemLine.startsWith('+')) {
+          payloadLines.push(itemLine.slice(1));
+          linePointer++;
+        } else if (itemLine === '') {
+          payloadLines.push('');
+          linePointer++;
         } else {
-          let trailingBlankOnly = true;
-          for (let lookahead = scanIndex; lookahead < finalNonEmptyIndex; lookahead++) {
-            if (
-              lines[lookahead].startsWith('*** Add File: ') ||
-              lines[lookahead].startsWith('*** Delete File: ') ||
-              lines[lookahead].startsWith('*** Update File: ') ||
-              lines[lookahead].trim() === '*** End Patch'
-            ) {
-              break;
-            }
-            if (!isWhitespaceLine(lines[lookahead])) {
-              trailingBlankOnly = false;
-              break;
-            }
-          }
-          if (trailingBlankOnly) {
-            while (
-              scanIndex < finalNonEmptyIndex &&
-              !(
-                lines[scanIndex].startsWith('*** Add File: ') ||
-                lines[scanIndex].startsWith('*** Delete File: ') ||
-                lines[scanIndex].startsWith('*** Update File: ') ||
-                lines[scanIndex].trim() === '*** End Patch'
-              )
-            ) {
-              scanIndex++;
-            }
+          if (checkV4ATrailingPaddingOnly(lines, linePointer, bodyEnd)) {
+            linePointer = advancePastV4APadding(lines, linePointer, bodyEnd);
             break;
           }
-          throw new PatchSyntaxError(`error: parse ${scanIndex + 1}`);
+          throw new PatchSyntaxError(`error: parse ${linePointer + 1}`);
         }
       }
+
       plannedEdits.push((tree) => {
-        if (!validatePathSafety(targetPath)) throw new PatchApplyFailure('unsafe', targetPath);
-        if (tree.pathExistsOnDiskOrStage(targetPath)) throw new PatchApplyFailure('exists', targetPath);
-        tree.stagedFiles.set(targetPath, addedFileLines.length === 0 ? '' : addedFileLines.join('\n') + '\n');
+        if (!validatePathSafety(addedFilePath)) throw new PatchApplyFailure('unsafe', addedFilePath);
+        if (tree.pathExistsOnDiskOrStage(addedFilePath)) throw new PatchApplyFailure('exists', addedFilePath);
+        const finalContent = payloadLines.length === 0 ? '' : payloadLines.join('\n') + '\n';
+        tree.stagedFiles.set(addedFilePath, finalContent);
       });
       continue;
     }
 
-    if (currentLine.startsWith('*** Delete File: ')) {
-      const targetPath = currentLine.slice(17).trim();
-      scanIndex++;
-      while (scanIndex < finalNonEmptyIndex && isWhitespaceLine(lines[scanIndex])) scanIndex++;
-      if (scanIndex < finalNonEmptyIndex && !lines[scanIndex].startsWith('*** ')) {
-        throw new PatchSyntaxError(`error: parse ${scanIndex + 1}`);
+    if (currentHeader.startsWith('*** Delete File: ')) {
+      const targetFilePath = currentHeader.slice(17).trim();
+      linePointer++;
+
+      while (linePointer < bodyEnd && isWhitespaceLine(lines[linePointer])) {
+        linePointer++;
       }
+      if (linePointer < bodyEnd && !lines[linePointer].startsWith('*** ')) {
+        throw new PatchSyntaxError(`error: parse ${linePointer + 1}`);
+      }
+
       plannedEdits.push((tree) => {
-        if (!validatePathSafety(targetPath)) throw new PatchApplyFailure('unsafe', targetPath);
-        if (tree.getCurrentContent(targetPath) === null) throw new PatchApplyFailure('missing', targetPath);
-        tree.stagedFiles.set(targetPath, null);
+        if (!validatePathSafety(targetFilePath)) throw new PatchApplyFailure('unsafe', targetFilePath);
+        if (tree.getCurrentContent(targetFilePath) === null) throw new PatchApplyFailure('missing', targetFilePath);
+        tree.stagedFiles.set(targetFilePath, null);
       });
       continue;
     }
 
-    if (currentLine.startsWith('*** Update File: ')) {
-      const sourcePath = currentLine.slice(17).trim();
-      const updateHeaderLineNumber = scanIndex + 1;
-      scanIndex++;
+    if (currentHeader.startsWith('*** Update File: ')) {
+      const initialFilePath = currentHeader.slice(17).trim();
+      const originHeaderNumber = linePointer + 1;
+      linePointer++;
 
-      let moveDestinationPath: string | null = null;
-      if (scanIndex < finalNonEmptyIndex && lines[scanIndex].startsWith('*** Move to: ')) {
-        moveDestinationPath = lines[scanIndex].slice(13).trim();
-        scanIndex++;
+      let relocatedDestination: string | null = null;
+      if (linePointer < bodyEnd && lines[linePointer].startsWith('*** Move to: ')) {
+        relocatedDestination = lines[linePointer].slice(13).trim();
+        linePointer++;
       }
 
-      const parsedChunks: ParsedV4AChunk[] = [];
-      let activeChunk: ParsedV4AChunk | null = null;
+      const fileHunksList: V4APatchHunk[] = [];
+      let pendingHunk: V4APatchHunk | null = null;
 
-      while (scanIndex < finalNonEmptyIndex) {
-        const subLine = lines[scanIndex];
+      while (linePointer < bodyEnd) {
+        const subLine = lines[linePointer];
         if (subLine.trim() === '*** End of File') {
-          if (activeChunk === null) {
-            activeChunk = { anchorLine: null, chunkLines: [], isTerminatedAtEof: true };
-            parsedChunks.push(activeChunk);
+          if (pendingHunk === null) {
+            pendingHunk = { contextAnchor: null, hunkDiffLines: [], eofTerminated: true };
+            fileHunksList.push(pendingHunk);
           } else {
-            activeChunk.isTerminatedAtEof = true;
+            pendingHunk.eofTerminated = true;
           }
-          scanIndex++;
-          activeChunk = null;
+          linePointer++;
+          pendingHunk = null;
           continue;
         }
-        if (
-          subLine.startsWith('*** Add File: ') ||
-          subLine.startsWith('*** Delete File: ') ||
-          subLine.startsWith('*** Update File: ') ||
-          subLine.trim() === '*** End Patch'
-        ) {
+
+        if (isV4ACommandBoundary(subLine)) {
           break;
         }
 
         if (subLine.startsWith('@@')) {
-          const anchorHeader = subLine.slice(2).trim();
-          activeChunk = { anchorLine: anchorHeader === '' ? null : anchorHeader, chunkLines: [], isTerminatedAtEof: false };
-          parsedChunks.push(activeChunk);
-          scanIndex++;
+          const rawAnchor = subLine.slice(2).trim();
+          pendingHunk = {
+            contextAnchor: rawAnchor === '' ? null : rawAnchor,
+            hunkDiffLines: [],
+            eofTerminated: false
+          };
+          fileHunksList.push(pendingHunk);
+          linePointer++;
           continue;
         }
 
         if (isWhitespaceLine(subLine)) {
-          let trailingBlankOnly = true;
-          for (let lookahead = scanIndex; lookahead < finalNonEmptyIndex; lookahead++) {
-            if (
-              lines[lookahead].startsWith('*** Add File: ') ||
-              lines[lookahead].startsWith('*** Delete File: ') ||
-              lines[lookahead].startsWith('*** Update File: ') ||
-              lines[lookahead].trim() === '*** End Patch'
-            ) {
-              break;
-            }
-            if (!isWhitespaceLine(lines[lookahead])) {
-              trailingBlankOnly = false;
-              break;
-            }
-          }
-          if (trailingBlankOnly) {
-            while (
-              scanIndex < finalNonEmptyIndex &&
-              !(
-                lines[scanIndex].startsWith('*** Add File: ') ||
-                lines[scanIndex].startsWith('*** Delete File: ') ||
-                lines[scanIndex].startsWith('*** Update File: ') ||
-                lines[scanIndex].trim() === '*** End Patch'
-              )
-            ) {
-              scanIndex++;
-            }
+          if (checkV4ATrailingPaddingOnly(lines, linePointer, bodyEnd)) {
+            linePointer = advancePastV4APadding(lines, linePointer, bodyEnd);
             break;
           }
         }
 
         if (subLine.startsWith(' ') || subLine.startsWith('-') || subLine.startsWith('+') || subLine === '') {
-          if (activeChunk === null) {
-            activeChunk = { anchorLine: null, chunkLines: [], isTerminatedAtEof: false };
-            parsedChunks.push(activeChunk);
+          if (pendingHunk === null) {
+            pendingHunk = { contextAnchor: null, hunkDiffLines: [], eofTerminated: false };
+            fileHunksList.push(pendingHunk);
           }
-          if (subLine.startsWith(' ')) activeChunk.chunkLines.push({ kind: ' ', text: subLine.slice(1) });
-          else if (subLine === '') activeChunk.chunkLines.push({ kind: ' ', text: '' });
-          else if (subLine.startsWith('-')) activeChunk.chunkLines.push({ kind: '-', text: subLine.slice(1) });
-          else activeChunk.chunkLines.push({ kind: '+', text: subLine.slice(1) });
-          scanIndex++;
+
+          if (subLine.startsWith(' ')) {
+            pendingHunk.hunkDiffLines.push({ indicator: ' ', lineText: subLine.slice(1) });
+          } else if (subLine === '') {
+            pendingHunk.hunkDiffLines.push({ indicator: ' ', lineText: '' });
+          } else if (subLine.startsWith('-')) {
+            pendingHunk.hunkDiffLines.push({ indicator: '-', lineText: subLine.slice(1) });
+          } else {
+            pendingHunk.hunkDiffLines.push({ indicator: '+', lineText: subLine.slice(1) });
+          }
+          linePointer++;
           continue;
         }
 
-        throw new PatchSyntaxError(`error: parse ${scanIndex + 1}`);
+        throw new PatchSyntaxError(`error: parse ${linePointer + 1}`);
       }
 
-      if (parsedChunks.length === 0 && moveDestinationPath === null) {
-        throw new PatchSyntaxError(`error: parse ${updateHeaderLineNumber}`);
+      if (fileHunksList.length === 0 && relocatedDestination === null) {
+        throw new PatchSyntaxError(`error: parse ${originHeaderNumber}`);
       }
 
-      if (moveDestinationPath !== null) {
-        recordedMoves.push({ oldPath: sourcePath, newPath: moveDestinationPath });
+      if (relocatedDestination !== null) {
+        recordedMoves.push({ oldPath: initialFilePath, newPath: relocatedDestination });
       }
 
       plannedEdits.push((tree) => {
-        if (!validatePathSafety(sourcePath)) throw new PatchApplyFailure('unsafe', sourcePath);
-        if (moveDestinationPath !== null && !validatePathSafety(moveDestinationPath)) throw new PatchApplyFailure('unsafe', moveDestinationPath);
-        if (tree.getCurrentContent(sourcePath) === null) throw new PatchApplyFailure('missing', sourcePath);
-        if (moveDestinationPath !== null && tree.pathExistsOnDiskOrStage(moveDestinationPath)) throw new PatchApplyFailure('exists', moveDestinationPath);
-
-        const currentText = tree.getCurrentContent(sourcePath)!;
-        const parsedDoc = dissectDocumentText(currentText);
-        let cursorIndex = 0;
-
-        for (const chunk of parsedChunks) {
-          if (chunk.anchorLine !== null) {
-            let anchorMatchIndex = -1;
-            // Tier 0 search
-            for (let idx = cursorIndex; idx < parsedDoc.lines.length; idx++) {
-              if (parsedDoc.lines[idx] === chunk.anchorLine) {
-                anchorMatchIndex = idx;
-                break;
-              }
-            }
-            if (anchorMatchIndex === -1 && !isStrictMatching) {
-              // Tier 1 search
-              for (let idx = cursorIndex; idx < parsedDoc.lines.length; idx++) {
-                if (stripTrailingWhitespace(parsedDoc.lines[idx]) === stripTrailingWhitespace(chunk.anchorLine)) {
-                  anchorMatchIndex = idx;
-                  break;
-                }
-              }
-            }
-            if (anchorMatchIndex === -1 && !isStrictMatching) {
-              // Tier 2 search
-              for (let idx = cursorIndex; idx < parsedDoc.lines.length; idx++) {
-                if (stripSurroundingWhitespace(parsedDoc.lines[idx]) === stripSurroundingWhitespace(chunk.anchorLine)) {
-                  anchorMatchIndex = idx;
-                  break;
-                }
-              }
-            }
-            if (anchorMatchIndex === -1) throw new PatchApplyFailure('no-match', sourcePath);
-            cursorIndex = anchorMatchIndex + 1;
-          }
-
-          const targetPattern: string[] = [];
-          const replacementHunks: UnifiedHunkElement[] = [];
-          for (const lineItem of chunk.chunkLines) {
-            if (lineItem.kind === ' ') {
-              const contextPos = targetPattern.length;
-              targetPattern.push(lineItem.text);
-              replacementHunks.push({ text: lineItem.text, isContext: true, contextIndex: contextPos });
-            } else if (lineItem.kind === '-') {
-              targetPattern.push(lineItem.text);
-            } else if (lineItem.kind === '+') {
-              replacementHunks.push({ text: lineItem.text, isContext: false });
-            }
-          }
-
-          if (targetPattern.length > 0) {
-            const matchRes = locatePatternOccurrences(parsedDoc.lines, targetPattern, isStrictMatching, cursorIndex, chunk.isTerminatedAtEof);
-            if (matchRes.matchingTier === -1 || matchRes.matchPositions.length === 0) throw new PatchApplyFailure('no-match', sourcePath);
-            const firstMatchPos = matchRes.matchPositions[0];
-            const substituted = substituteTargetLines(parsedDoc.lines, firstMatchPos, targetPattern, replacementHunks, matchRes.matchingTier);
-            parsedDoc.lines.splice(firstMatchPos, targetPattern.length, ...substituted);
-            cursorIndex = firstMatchPos + substituted.length;
-          } else {
-            const insertionPosition = chunk.isTerminatedAtEof ? parsedDoc.lines.length : cursorIndex;
-            const substituted = substituteTargetLines(parsedDoc.lines, insertionPosition, [''], replacementHunks, 0);
-            parsedDoc.lines.splice(insertionPosition, 0, ...substituted);
-            cursorIndex = insertionPosition + substituted.length;
-          }
+        if (!validatePathSafety(initialFilePath)) throw new PatchApplyFailure('unsafe', initialFilePath);
+        if (relocatedDestination !== null && !validatePathSafety(relocatedDestination)) {
+          throw new PatchApplyFailure('unsafe', relocatedDestination);
+        }
+        if (tree.getCurrentContent(initialFilePath) === null) {
+          throw new PatchApplyFailure('missing', initialFilePath);
+        }
+        if (relocatedDestination !== null && tree.pathExistsOnDiskOrStage(relocatedDestination)) {
+          throw new PatchApplyFailure('exists', relocatedDestination);
         }
 
-        const serializedResult = assembleDocumentText(parsedDoc.lines, parsedDoc.isWindowsCrlf, parsedDoc.hasTerminalNewline);
-        if (moveDestinationPath !== null) {
-          tree.stagedFiles.set(sourcePath, null);
-          tree.stagedFiles.set(moveDestinationPath, serializedResult);
+        const sourceDocumentText = tree.getCurrentContent(initialFilePath)!;
+        const parsedDocument = dissectDocumentText(sourceDocumentText);
+        let mutationOffset = 0;
+
+        for (const singleHunk of fileHunksList) {
+          mutationOffset = executeV4AHunkTransformation(
+            parsedDocument,
+            singleHunk,
+            mutationOffset,
+            isStrictMatching,
+            initialFilePath
+          );
+        }
+
+        const serializedOutput = assembleDocumentText(
+          parsedDocument.lines,
+          parsedDocument.isWindowsCrlf,
+          parsedDocument.hasTerminalNewline
+        );
+
+        if (relocatedDestination !== null) {
+          tree.stagedFiles.set(initialFilePath, null);
+          tree.stagedFiles.set(relocatedDestination, serializedOutput);
         } else {
-          tree.stagedFiles.set(sourcePath, serializedResult);
+          tree.stagedFiles.set(initialFilePath, serializedOutput);
         }
       });
       continue;
     }
 
-    throw new PatchSyntaxError(`error: parse ${scanIndex + 1}`);
+    throw new PatchSyntaxError(`error: parse ${linePointer + 1}`);
   }
 
   return plannedEdits;
