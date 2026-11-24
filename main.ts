@@ -75,6 +75,12 @@ class WorkingTreeState {
       statSync(relPath);
       return true;
     } catch {
+      const dirPrefix = relPath.endsWith('/') ? relPath : relPath + '/';
+      for (const [keyPath, content] of this.stagedFiles) {
+        if (content !== null && keyPath.startsWith(dirPrefix)) {
+          return true;
+        }
+      }
       return false;
     }
   }
@@ -140,10 +146,12 @@ function locatePatternOccurrences(
 
   // Tier 1: comparison ignoring trailing tabs and spaces
   const matchesTier1: number[] = [];
+  const patternTier1 = patternLines.map(stripTrailingWhitespace);
+  const docTier1 = documentLines.map(stripTrailingWhitespace);
   for (let scanIdx = startScanIndex; scanIdx <= documentLines.length - patternLines.length; scanIdx++) {
     let tier1Match = true;
     for (let offset = 0; offset < patternLines.length; offset++) {
-      if (stripTrailingWhitespace(documentLines[scanIdx + offset]) !== stripTrailingWhitespace(patternLines[offset])) {
+      if (docTier1[scanIdx + offset] !== patternTier1[offset]) {
         tier1Match = false;
         break;
       }
@@ -156,10 +164,12 @@ function locatePatternOccurrences(
 
   // Tier 2: comparison ignoring both leading and trailing whitespace
   const matchesTier2: number[] = [];
+  const patternTier2 = patternLines.map(stripSurroundingWhitespace);
+  const docTier2 = documentLines.map(stripSurroundingWhitespace);
   for (let scanIdx = startScanIndex; scanIdx <= documentLines.length - patternLines.length; scanIdx++) {
     let tier2Match = true;
     for (let offset = 0; offset < patternLines.length; offset++) {
-      if (stripSurroundingWhitespace(documentLines[scanIdx + offset]) !== stripSurroundingWhitespace(patternLines[offset])) {
+      if (docTier2[scanIdx + offset] !== patternTier2[offset]) {
         tier2Match = false;
         break;
       }
@@ -273,6 +283,7 @@ function parseJsonEditDescriptor(descriptor: unknown): FileMutationAction | null
       let occurrenceCount = 0;
       for (let pos = normalizedPrior.indexOf(normalizedSearch); pos >= 0; pos = normalizedPrior.indexOf(normalizedSearch, pos + 1)) {
         occurrenceCount++;
+        if (occurrenceCount > 1) break;
       }
       if (occurrenceCount === 0) throw new PatchApplyFailure('no-match', targetPath);
       if (occurrenceCount > 1) throw new PatchApplyFailure('ambiguous', targetPath);
@@ -895,6 +906,10 @@ function buildV4AEdits(
         }
       }
 
+      while (payloadLines.length > 0 && isWhitespaceLine(payloadLines[payloadLines.length - 1])) {
+        payloadLines.pop();
+      }
+
       plannedEdits.push((tree) => {
         if (!validatePathSafety(addedFilePath)) throw new PatchApplyFailure('unsafe', addedFilePath);
         if (tree.pathExistsOnDiskOrStage(addedFilePath)) throw new PatchApplyFailure('exists', addedFilePath);
@@ -1172,13 +1187,34 @@ export function run(argvList: string[]): { code: number; out: string[] } {
         displayText: `${originalText === null ? 'A' : updatedText === null ? 'D' : 'M'} ${modifiedPath}`
       });
     }
+  }
 
-    if (isCheckMode) continue;
-    if (updatedText === null) {
-      rmSync(modifiedPath, { force: true });
-    } else {
-      mkdirSync(dirname(modifiedPath), { recursive: true });
-      writeFileSync(modifiedPath, updatedText);
+  if (!isCheckMode) {
+    // Phase 1: remove deleted files and directories that will be replaced by files
+    for (const modifiedPath of workingTree.stagedFiles.keys()) {
+      const originalText = workingTree.getOriginalContent(modifiedPath);
+      const updatedText = workingTree.stagedFiles.get(modifiedPath)!;
+      if (originalText === updatedText) continue;
+      if (updatedText === null) {
+        rmSync(modifiedPath, { force: true });
+      } else {
+        try {
+          const st = statSync(modifiedPath);
+          if (st.isDirectory()) {
+            rmSync(modifiedPath, { recursive: true, force: true });
+          }
+        } catch {}
+      }
+    }
+    // Phase 2: create directories and write files
+    for (const modifiedPath of workingTree.stagedFiles.keys()) {
+      const originalText = workingTree.getOriginalContent(modifiedPath);
+      const updatedText = workingTree.stagedFiles.get(modifiedPath)!;
+      if (originalText === updatedText) continue;
+      if (updatedText !== null) {
+        mkdirSync(dirname(modifiedPath), { recursive: true });
+        writeFileSync(modifiedPath, updatedText);
+      }
     }
   }
 
